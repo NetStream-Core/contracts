@@ -1,0 +1,320 @@
+openapi: 3.0.3
+info:
+  title: NetStream Backend (control plane)
+  version: "1.0"
+  description: >
+    Sensor registry, versioned desired configuration, model registry
+    metadata. Does not touch telemetry (see events/ and kafka/topics.md) —
+    this is control-plane state, stored in PostgreSQL.
+servers:
+  - url: http://localhost:9999
+
+paths:
+  /api/v1/sensors/register:
+    post:
+      operationId: registerSensor
+      summary: Register or heartbeat a sensor
+      description: >
+        Upserts by host_id and refreshes last_seen. Never advances
+        config_version — that only moves through PUT .../config.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterSensorRequest'
+      responses:
+        '200':
+          description: Sensor row after upsert
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sensor'
+
+  /api/v1/sensors:
+    get:
+      operationId: listSensors
+      summary: List sensors
+      responses:
+        '200':
+          description: All sensors, ordered by host_id
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Sensor'
+
+  /api/v1/sensors/{host_id}:
+    get:
+      operationId: getSensor
+      summary: Get one sensor
+      parameters:
+        - $ref: '#/components/parameters/HostId'
+      responses:
+        '200':
+          description: Sensor
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sensor'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/sensors/{host_id}/config:
+    get:
+      operationId: getDesiredConfig
+      summary: Get the current desired config (latest version)
+      parameters:
+        - $ref: '#/components/parameters/HostId'
+      responses:
+        '200':
+          description: Latest config snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentConfig'
+        '404':
+          description: No config has ever been set for this sensor
+    put:
+      operationId: setDesiredConfig
+      summary: Set a new desired config version
+      description: >
+        The request body becomes the entire new payload — not a delta.
+        Applied as one transactional snapshot: sensors.config_version is
+        bumped and the new agent_configs row is inserted together, so a
+        reader never observes a config_version without a matching payload.
+      parameters:
+        - $ref: '#/components/parameters/HostId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Arbitrary JSON payload, whatever shape the agent expects
+      responses:
+        '200':
+          description: The newly created config version
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentConfig'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/models:
+    post:
+      operationId: registerModel
+      summary: Register a model version
+      description: Idempotent by (name, version) — re-registering updates the row.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterModelRequest'
+      responses:
+        '200':
+          description: Registered model
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Model'
+    get:
+      operationId: listModels
+      summary: List models
+      responses:
+        '200':
+          description: All models, ordered by name then newest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Model'
+
+  /api/v1/models/{name}/{version}:
+    get:
+      operationId: getModel
+      summary: Get one model
+      parameters:
+        - $ref: '#/components/parameters/ModelName'
+        - $ref: '#/components/parameters/ModelVersion'
+      responses:
+        '200':
+          description: Model
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Model'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/models/{name}/{version}/artifact:
+    put:
+      operationId: uploadModelArtifact
+      summary: Upload the model's artifact
+      description: >
+        The model must already be registered. The request body (raw bytes,
+        Content-Length required) is stored in the object store and
+        artifact_uri is updated on the registry entry.
+      parameters:
+        - $ref: '#/components/parameters/ModelName'
+        - $ref: '#/components/parameters/ModelVersion'
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Model with artifact_uri set
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Model'
+        '404':
+          description: Model not registered yet
+    get:
+      operationId: downloadModelArtifact
+      summary: Download the model's artifact
+      description: >
+        Redirects to a time-limited (15 minute) presigned URL — the backend
+        never proxies the artifact's bytes itself.
+      parameters:
+        - $ref: '#/components/parameters/ModelName'
+        - $ref: '#/components/parameters/ModelVersion'
+      responses:
+        '302':
+          description: Redirect to a presigned download URL
+        '404':
+          description: Model not found, or has no artifact uploaded yet
+
+components:
+  parameters:
+    HostId:
+      name: host_id
+      in: path
+      required: true
+      schema:
+        type: string
+    ModelName:
+      name: name
+      in: path
+      required: true
+      schema:
+        type: string
+    ModelVersion:
+      name: version
+      in: path
+      required: true
+      schema:
+        type: string
+
+  responses:
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+
+  schemas:
+    RegisterSensorRequest:
+      type: object
+      required: [host_id]
+      properties:
+        host_id:
+          type: string
+        hostname:
+          type: string
+        agent_version:
+          type: string
+
+    Sensor:
+      type: object
+      properties:
+        id:
+          type: integer
+        host_id:
+          type: string
+        hostname:
+          type: string
+        agent_version:
+          type: string
+        config_version:
+          type: integer
+        last_seen:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+
+    AgentConfig:
+      type: object
+      properties:
+        sensor_id:
+          type: integer
+        version:
+          type: integer
+        payload:
+          type: object
+        created_at:
+          type: string
+          format: date-time
+
+    RegisterModelRequest:
+      type: object
+      required: [name, version]
+      properties:
+        name:
+          type: string
+        version:
+          type: string
+        algorithm:
+          type: string
+        features_version:
+          type: string
+        dataset_ref:
+          type: string
+        git_sha:
+          type: string
+        metrics:
+          type: object
+        artifact_uri:
+          type: string
+
+    Model:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        version:
+          type: string
+        algorithm:
+          type: string
+        features_version:
+          type: string
+        dataset_ref:
+          type: string
+        git_sha:
+          type: string
+        metrics:
+          type: object
+        artifact_uri:
+          type: string
+          description: "objectstore://<bucket>/<key>, empty until an artifact is uploaded"
+        status:
+          type: string
+        created_at:
+          type: string
+          format: date-time
