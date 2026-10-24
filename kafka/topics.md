@@ -5,8 +5,9 @@
 | `netstream.events.v1` | OTLP-логи: `netstream.flow`, `netstream.dns.query`, `netstream.blocklist.hit` | `otlp_proto` | 3 | 7 дней (`retention.ms=604800000`) |
 | `netstream.metrics.v1` | OTLP-метрики агента (`netstream_*` — накладные расходы, см. `deploy/README.md`) | `otlp_proto` | 3 | 7 дней |
 | `netstream.detections.v1` | Результат оценки каждого закрывшегося окна онлайн-детектором: `host_id`, `src_ip`, `window_start`, `window_seconds`, `score`, `is_attack`, `latency_ms` | `JSONEachRow` (не OTLP — не телеметрия, а результат уже обработанных данных) | 3 | 7 дней (`retention.ms=604800000`) |
+| `netstream.alerts.v1` | Один инцидент — один алерт (не одна детекция): `incident_id`, `host_id`, `src_ip`, `severity`, `opened_at` | `JSONEachRow` | 3 | 7 дней (`retention.ms=604800000`) |
 
-Все три топика создаются идемпотентно (`--create --if-not-exists`) сервисом `kafka-init` в `deploy/compose.yml`; `max.message.bytes=4194304` (4 МиБ, запас на батч OTLP-записей/детекций).
+Все четыре топика создаются идемпотентно (`--create --if-not-exists`) сервисом `kafka-init` в `deploy/compose.yml`; `max.message.bytes=4194304` (4 МиБ, запас на батч OTLP-записей/детекций/алертов).
 
 `netstream.events.v1` создаётся с тремя партициями, и Kafka не даёт порядок между разными партициями — только в пределах одной. `otel-edge` включает `partition_logs_by_resource_attributes: true` (`deploy/collector/edge.yaml`, `edge-tls.yaml`), так что партиция считается хэшем ресурсных атрибутов батча (`host.id`, `service.instance.id`) — все записи одного сенсора за время жизни одного процесса агента стабильно попадают в одну партицию, что нужно `WindowAccumulator` (и `ml`'s `OnlineDetector`, и будущим его аналогам) для корректного закрытия окон по порядку прибытия.
 
@@ -18,10 +19,10 @@
   - `ml`'s онлайн-детектор (`netstream_ml.detector`, `detect run`), группа задаётся явно через `--consumer-group` (по умолчанию `netstream-detector`) — кормит `WindowAccumulator`, оценивает закрывшиеся окна обученной моделью, публикует результат в `netstream.detections.v1`.
 - **Consumer `netstream.metrics.v1`**: `otel-gateway` (та же группа `netstream-gateway`).
 - **Producer `netstream.detections.v1`**: `ml`'s онлайн-детектор. Входной офсет `netstream.events.v1` коммитится вручную, только после того как публикация в `netstream.detections.v1` подтверждена брокером — см. `ml/docs/online-detector.md`, раздел «Надёжность: ручной commit, идемпотентный producer, дедупликация детекций».
-- **Consumer `netstream.detections.v1`**: ClickHouse — напрямую, через таблицу с движком `Kafka` (группа `clickhouse-detections`) и materialized view в `detections` (`deploy/clickhouse/migrations/015_detections.sql`), без промежуточного сервиса.
+- **Consumer `netstream.detections.v1`**: два независимых consumer'а, каждый со своей группой:
+  - ClickHouse — напрямую, через таблицу с движком `Kafka` (группа `clickhouse-detections`) и materialized view в `detections` (`deploy/clickhouse/migrations/015_detections.sql`), без промежуточного сервиса.
+  - `backend` (группа `netstream-backend-incidents`, см. его README, раздел «Инциденты») — сворачивает детекции с `is_attack: true` в инциденты по `(host_id, src_ip)`, публикует в `netstream.alerts.v1`.
+- **Producer `netstream.alerts.v1`**: `backend`. Не на каждую детекцию — только когда детекция открывает новый инцидент (повторные детекции по уже открытому в течение 5 минут инциденту продлевают его и не публикуют новый алерт).
+- **Consumer `netstream.alerts.v1`**: пока нет (топик существует для будущего потребителя — нотификации, вебхук; оператор смотрит открытые инциденты через `GET /api/v1/incidents` backend'а напрямую).
 
-Разделение `netstream.events.v1`/`netstream.metrics.v1` по типу сигнала (а не один общий топик) позволяет масштабировать/настраивать consumer'ов независимо для логов и метрик, если один поток станет узким местом — сейчас оба идут в один и тот же `otel-gateway`, разделение уже сделано на будущее. `netstream.detections.v1` — отдельный топик с другим форматом сообщений (не OTLP), поскольку это уже не телеметрия, а результат её обработки.
-
-## Пока не существует (план)
-
-`netstream.alerts.v1` — появится вместе с коррелятором инцидентов (группировка повторных/связанных детекций в один инцидент, таблица `incidents` в PostgreSQL `backend` уже создана, обработчиков ещё нет); заранее не заводится, чтобы не плодить пустой топик без потребителя.
+Разделение `netstream.events.v1`/`netstream.metrics.v1` по типу сигнала (а не один общий топик) позволяет масштабировать/настраивать consumer'ов независимо для логов и метрик, если один поток станет узким местом — сейчас оба идут в один и тот же `otel-gateway`, разделение уже сделано на будущее. `netstream.detections.v1`/`netstream.alerts.v1` — отдельные топики с другим форматом сообщений (не OTLP), поскольку это уже не телеметрия, а результат её обработки.
